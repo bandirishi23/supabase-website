@@ -2,9 +2,11 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { supabase } from '../lib/supabase'
-import DataTable from '../components/data-table/DataTable'
-import { FileSpreadsheet, Plus, Trash2, Eye, Loader, Calendar, Hash } from 'lucide-react'
-import { format } from 'date-fns'
+import SelectableDataTable from '../components/data-table/SelectableDataTable'
+import TemplateSelector from '../components/pitch/TemplateSelector'
+import EmailSendModal from '../components/pitch/EmailSendModal'
+import { FileSpreadsheet, Plus, Eye, Loader, MessageSquare, Mail, X } from 'lucide-react'
+import { generatePitchBatch, validateTemplate, isOpenAIConfigured } from '../services/openai'
 
 interface Dataset {
   id: string
@@ -22,15 +24,51 @@ export default function MyDatasets() {
   const [datasets, setDatasets] = useState<Dataset[]>([])
   const [selectedDataset, setSelectedDataset] = useState<Dataset | null>(null)
   const [datasetRows, setDatasetRows] = useState<any[]>([])
+  const [selectedRows, setSelectedRows] = useState<any[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isLoadingRows, setIsLoadingRows] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  
+  // Pitch generation state
+  const [showPitchGenerator, setShowPitchGenerator] = useState(false)
+  const [pitchTemplate, setPitchTemplate] = useState('')
+  const [pitchSubject, setPitchSubject] = useState('')
+  const [isGeneratingPitches, setIsGeneratingPitches] = useState(false)
+  const [generatedPitches, setGeneratedPitches] = useState<Map<number, { pitch: string; status: string; generatedAt: string; subject?: string }>>(new Map())
+  const [generationProgress, setGenerationProgress] = useState({ current: 0, total: 0 })
+  
+  // Email sending state
+  const [showEmailModal, setShowEmailModal] = useState(false)
+  
+  // Pitch preview state
+  const [previewPitch, setPreviewPitch] = useState<{ index: number; content: string } | null>(null)
 
   useEffect(() => {
     if (user) {
       fetchDatasets()
     }
   }, [user])
+
+  // Auto-load dataset from localStorage selection
+  useEffect(() => {
+    const checkSelectedDataset = () => {
+      const savedDatasetId = localStorage.getItem('selectedDatasetId')
+      if (savedDatasetId && datasets.length > 0) {
+        const dataset = datasets.find(d => d.id === savedDatasetId)
+        if (dataset && (!selectedDataset || selectedDataset.id !== dataset.id)) {
+          loadDatasetRows(dataset)
+        }
+      }
+    }
+    
+    checkSelectedDataset()
+    
+    // Listen for storage changes (from sidebar)
+    const handleStorageChange = () => checkSelectedDataset()
+    window.addEventListener('storage', handleStorageChange)
+    
+    return () => window.removeEventListener('storage', handleStorageChange)
+  }, [datasets, user])
 
   const fetchDatasets = async () => {
     setIsLoading(true)
@@ -55,6 +93,8 @@ export default function MyDatasets() {
   const loadDatasetRows = async (dataset: Dataset) => {
     setIsLoadingRows(true)
     setSelectedDataset(dataset)
+    setGeneratedPitches(new Map()) // Clear previous pitches
+    setSelectedRows([])
     
     try {
       const { data, error } = await supabase
@@ -76,36 +116,101 @@ export default function MyDatasets() {
     }
   }
 
-  const deleteDataset = async (datasetId: string) => {
-    if (!window.confirm('Are you sure you want to delete this dataset? This action cannot be undone.')) {
+
+  const handleGeneratePitches = async () => {
+    if (!isOpenAIConfigured()) {
+      setError('OpenAI API key is not configured. Please add REACT_APP_OPENAI_API_KEY to your environment variables.')
       return
     }
 
+    if (!selectedDataset || !pitchTemplate.trim()) {
+      setError('Please select a dataset and enter a pitch template')
+      return
+    }
+
+    if (selectedRows.length === 0) {
+      setError('Please select at least one row to generate pitches')
+      return
+    }
+
+    const availableColumns = Object.keys(selectedDataset.column_mappings || {})
+    const validation = validateTemplate(pitchTemplate, availableColumns)
+    
+    if (!validation.isValid) {
+      setError(`Invalid placeholders: ${validation.invalidPlaceholders.join(', ')}. Available columns: ${availableColumns.join(', ')}`)
+      return
+    }
+
+    setIsGeneratingPitches(true)
+    setError(null)
+
     try {
-      const { error } = await supabase
-        .from('datasets')
-        .delete()
-        .eq('id', datasetId)
+      const results = await generatePitchBatch(
+        pitchTemplate,
+        selectedRows, // Only generate for selected rows
+        (current, total, result) => {
+          setGenerationProgress({ current, total })
+        }
+      )
       
-      if (error) throw error
-      
-      // Remove from local state
-      setDatasets(datasets.filter(d => d.id !== datasetId))
-      if (selectedDataset?.id === datasetId) {
-        setSelectedDataset(null)
-        setDatasetRows([])
+      // Store generated pitches with their row indices
+      const newPitches = new Map(generatedPitches)
+      selectedRows.forEach((row, index) => {
+        const rowIndex = datasetRows.indexOf(row)
+        if (rowIndex !== -1 && results[index]) {
+          newPitches.set(rowIndex, {
+            pitch: results[index].pitch || '',
+            status: results[index].success ? 'generated' : 'failed',
+            generatedAt: new Date().toISOString(),
+            subject: pitchSubject
+          })
+        }
+      })
+      setGeneratedPitches(newPitches)
+
+      // Save pitches to database
+      if (user) {
+        const pitchRecords = results.map((result, index) => ({
+          user_id: user.id,
+          dataset_id: selectedDataset.id,
+          recipient_data: selectedRows[index],
+          generated_subject: pitchSubject,
+          generated_content: result.pitch || '',
+          status: 'draft'
+        }))
+
+        await supabase.from('generated_pitches').insert(pitchRecords)
       }
     } catch (err) {
-      console.error('Error deleting dataset:', err)
-      setError('Failed to delete dataset')
+      console.error('Error generating pitches:', err)
+      setError('Failed to generate pitches')
+    } finally {
+      setIsGeneratingPitches(false)
+      setGenerationProgress({ current: 0, total: 0 })
     }
+  }
+
+  const handleTemplateSelect = (template: string, subject?: string) => {
+    setPitchTemplate(template)
+    if (subject) {
+      setPitchSubject(subject)
+    }
+  }
+
+  const handlePreviewPitch = (rowIndex: number, pitch: string) => {
+    setPreviewPitch({ index: rowIndex, content: pitch })
+  }
+
+  const getAvailableColumns = () => {
+    if (!selectedDataset) return []
+    return Object.keys(selectedDataset.column_mappings || {})
   }
 
   if (!user) {
     return (
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="bg-yellow-50 border border-yellow-200 rounded-md p-4">
-          <p className="text-yellow-800">Please log in to view your datasets.</p>
+        <div className="bg-yellow-900/20 border border-yellow-600 rounded-md p-4">
+          <p className="text-yellow-400">Please log in to view your datasets.</p>
         </div>
       </div>
     )
@@ -115,14 +220,14 @@ export default function MyDatasets() {
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       <div className="mb-8 flex justify-between items-center">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">My Datasets</h1>
-          <p className="mt-2 text-gray-600">
-            View and manage your imported Excel datasets
+          <h1 className="text-3xl font-bold text-white">My Properties</h1>
+          <p className="mt-2 text-gray-400">
+            View and manage your imported property datasets
           </p>
         </div>
         <button
           onClick={() => navigate('/import-data')}
-          className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 flex items-center"
+          className="px-4 py-2 bg-emerald-600 text-white rounded-md hover:bg-emerald-700 flex items-center"
         >
           <Plus className="h-5 w-5 mr-2" />
           Import New Dataset
@@ -130,111 +235,158 @@ export default function MyDatasets() {
       </div>
 
       {error && (
-        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-md">
-          <p className="text-red-800">{error}</p>
+        <div className="mb-6 p-4 bg-red-900/20 border border-red-600 rounded-md">
+          <p className="text-red-400">{error}</p>
         </div>
       )}
 
       {isLoading ? (
         <div className="flex items-center justify-center py-12">
-          <Loader className="h-8 w-8 animate-spin text-indigo-600" />
-          <span className="ml-2 text-gray-600">Loading datasets...</span>
+          <Loader className="h-8 w-8 animate-spin text-emerald-600" />
+          <span className="ml-2 text-gray-400">Loading datasets...</span>
         </div>
       ) : datasets.length === 0 ? (
-        <div className="bg-white shadow rounded-lg p-12 text-center">
-          <FileSpreadsheet className="h-16 w-16 text-gray-400 mx-auto mb-4" />
-          <h3 className="text-lg font-medium text-gray-900 mb-2">No datasets yet</h3>
-          <p className="text-gray-600 mb-6">
-            Import your first Excel file to get started
+        <div className="bg-gray-900 rounded-lg p-12 text-center border border-gray-800">
+          <FileSpreadsheet className="h-16 w-16 text-gray-600 mx-auto mb-4" />
+          <h3 className="text-lg font-medium text-white mb-2">No datasets yet</h3>
+          <p className="text-gray-400 mb-6">
+            Import your first property dataset to get started
           </p>
           <button
             onClick={() => navigate('/import-data')}
-            className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700"
+            className="px-4 py-2 bg-emerald-600 text-white rounded-md hover:bg-emerald-700"
           >
             Import Your First Dataset
           </button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Dataset List */}
-          <div className="lg:col-span-1">
-            <h2 className="text-lg font-semibold text-gray-900 mb-4">Your Datasets</h2>
-            <div className="space-y-3">
-              {datasets.map((dataset) => (
-                <div
-                  key={dataset.id}
-                  className={`
-                    bg-white border rounded-lg p-4 cursor-pointer transition-all
-                    ${selectedDataset?.id === dataset.id 
-                      ? 'border-indigo-500 shadow-md' 
-                      : 'border-gray-200 hover:border-gray-300'
-                    }
-                  `}
-                  onClick={() => loadDatasetRows(dataset)}
-                >
-                  <div className="flex items-start justify-between">
-                    <div className="flex-1">
-                      <h3 className="font-medium text-gray-900 truncate">
-                        {dataset.name}
-                      </h3>
-                      <p className="text-sm text-gray-500 mt-1">
-                        {dataset.original_filename}
-                      </p>
-                      <div className="flex items-center space-x-4 mt-2 text-xs text-gray-500">
-                        <span className="flex items-center">
-                          <Hash className="h-3 w-3 mr-1" />
-                          {dataset.total_rows} rows
-                        </span>
-                        <span className="flex items-center">
-                          <Calendar className="h-3 w-3 mr-1" />
-                          {format(new Date(dataset.created_at), 'MMM d, yyyy')}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="flex space-x-1 ml-2">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          loadDatasetRows(dataset)
-                        }}
-                        className="p-1 hover:bg-gray-100 rounded"
-                        title="View data"
-                      >
-                        <Eye className="h-4 w-4 text-gray-500" />
-                      </button>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          deleteDataset(dataset.id)
-                        }}
-                        className="p-1 hover:bg-red-50 rounded"
-                        title="Delete dataset"
-                      >
-                        <Trash2 className="h-4 w-4 text-red-500" />
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Dataset Data View */}
-          <div className="lg:col-span-2">
-            {selectedDataset ? (
-              <div className="bg-white shadow rounded-lg p-6">
+        <div>
+          {selectedDataset ? (
+              <div className="bg-gray-900 rounded-lg p-6 border border-gray-800">
                 {isLoadingRows ? (
                   <div className="flex items-center justify-center py-12">
-                    <Loader className="h-8 w-8 animate-spin text-indigo-600" />
-                    <span className="ml-2 text-gray-600">Loading data...</span>
+                    <Loader className="h-8 w-8 animate-spin text-emerald-600" />
+                    <span className="ml-2 text-gray-400">Loading data...</span>
                   </div>
                 ) : datasetRows.length > 0 ? (
-                  <DataTable
-                    data={datasetRows}
-                    columns={Object.keys(selectedDataset.column_mappings || {})}
-                    title={selectedDataset.name}
-                    enableExport={true}
-                  />
+                  <>
+                    {/* Pitch Generator Section */}
+                    <div className="mb-6 p-4 bg-gray-800 rounded-lg">
+                      <div className="flex items-center justify-between mb-4">
+                        <h3 className="text-lg font-semibold text-white flex items-center">
+                          <MessageSquare className="h-5 w-5 mr-2 text-emerald-500" />
+                          AI Pitch Generator
+                        </h3>
+                        <button
+                          onClick={() => setShowPitchGenerator(!showPitchGenerator)}
+                          className="text-sm text-emerald-400 hover:text-emerald-300"
+                        >
+                          {showPitchGenerator ? 'Hide' : 'Show'} Generator
+                        </button>
+                      </div>
+                      
+                      {showPitchGenerator && (
+                        <div className="space-y-4">
+                          {/* Template Selector */}
+                          <TemplateSelector
+                            onTemplateSelect={handleTemplateSelect}
+                            userId={user?.id}
+                          />
+
+                          {/* Subject Line */}
+                          <div>
+                            <label className="block text-sm font-medium text-gray-300 mb-2">
+                              Email Subject (Optional)
+                            </label>
+                            <input
+                              type="text"
+                              value={pitchSubject}
+                              onChange={(e) => setPitchSubject(e.target.value)}
+                              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                              placeholder="Enter email subject..."
+                            />
+                          </div>
+
+                          {/* Template Editor */}
+                          <div>
+                            <label className="block text-sm font-medium text-gray-300 mb-2">
+                              Pitch Template
+                            </label>
+                            <textarea
+                              value={pitchTemplate}
+                              onChange={(e) => setPitchTemplate(e.target.value)}
+                              placeholder={`Enter your pitch template using placeholders like {{column_name}}...\n\nAvailable columns: ${getAvailableColumns().join(', ')}`}
+                              className="w-full h-32 p-3 bg-gray-700 border border-gray-600 rounded-md text-white font-mono text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                            />
+                            <p className="text-xs text-gray-500 mt-1">
+                              Use {'{{column_name}}'} to insert data from your dataset
+                            </p>
+                          </div>
+                          
+                          <div className="flex space-x-3">
+                            <button
+                              onClick={handleGeneratePitches}
+                              disabled={isGeneratingPitches || !pitchTemplate.trim() || selectedRows.length === 0}
+                              className="px-4 py-2 bg-emerald-600 text-white rounded-md hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center"
+                            >
+                              {isGeneratingPitches ? (
+                                <>
+                                  <Loader className="h-4 w-4 mr-2 animate-spin" />
+                                  Generating...
+                                </>
+                              ) : (
+                                <>
+                                  <MessageSquare className="h-4 w-4 mr-2" />
+                                  Generate for {selectedRows.length} Selected
+                                </>
+                              )}
+                            </button>
+                            
+                            {generatedPitches.size > 0 && (
+                              <button
+                                onClick={() => setShowEmailModal(true)}
+                                disabled={selectedRows.length === 0}
+                                className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 flex items-center"
+                              >
+                                <Mail className="h-4 w-4 mr-2" />
+                                Send Emails
+                              </button>
+                            )}
+                          </div>
+                          
+                          {isGeneratingPitches && (
+                            <div className="bg-emerald-900/20 border border-emerald-600 rounded-md p-3">
+                              <div className="flex items-center justify-between">
+                                <span className="text-sm text-emerald-400">
+                                  Generating pitch {generationProgress.current} of {generationProgress.total}...
+                                </span>
+                                <span className="text-sm text-emerald-300">
+                                  {Math.round((generationProgress.current / generationProgress.total) * 100)}%
+                                </span>
+                              </div>
+                              <div className="w-full bg-gray-700 rounded-full h-2 mt-2">
+                                <div 
+                                  className="bg-emerald-500 h-2 rounded-full transition-all duration-300"
+                                  style={{ width: `${(generationProgress.current / generationProgress.total) * 100}%` }}
+                                ></div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    
+                    {/* Data Table with Selection */}
+                    <SelectableDataTable
+                      data={datasetRows}
+                      columns={Object.keys(selectedDataset.column_mappings || {})}
+                      title={selectedDataset.name}
+                      enableExport={true}
+                      onSelectionChange={setSelectedRows}
+                      generatedPitches={generatedPitches}
+                      onPreviewPitch={handlePreviewPitch}
+                    />
+                  </>
                 ) : (
                   <div className="text-center py-12">
                     <p className="text-gray-500">No data found in this dataset</p>
@@ -242,16 +394,53 @@ export default function MyDatasets() {
                 )}
               </div>
             ) : (
-              <div className="bg-white shadow rounded-lg p-12 text-center">
-                <Eye className="h-16 w-16 text-gray-400 mx-auto mb-4" />
-                <h3 className="text-lg font-medium text-gray-900 mb-2">
+              <div className="bg-gray-900 rounded-lg p-12 text-center border border-gray-800">
+                <Eye className="h-16 w-16 text-gray-600 mx-auto mb-4" />
+                <h3 className="text-lg font-medium text-white mb-2">
                   Select a dataset to view
                 </h3>
-                <p className="text-gray-600">
-                  Click on any dataset from the list to view its data
+                <p className="text-gray-400">
+                  Use the "My Leads" dropdown in the sidebar to select a dataset
                 </p>
               </div>
             )}
+        </div>
+      )}
+
+      {/* Email Send Modal */}
+      <EmailSendModal
+        isOpen={showEmailModal}
+        onClose={() => setShowEmailModal(false)}
+        selectedRows={selectedRows}
+        generatedPitches={new Map(selectedRows.map((row, index) => {
+          const rowIndex = datasetRows.indexOf(row)
+          const pitch = generatedPitches.get(rowIndex)
+          return [index, pitch ? { pitch: pitch.pitch, subject: pitch.subject } : { pitch: '', subject: '' }]
+        }))}
+        columns={getAvailableColumns()}
+        userId={user?.id || ''}
+      />
+
+      {/* Pitch Preview Modal */}
+      {previewPitch && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 rounded-lg max-w-3xl w-full max-h-[80vh] overflow-hidden border border-gray-800">
+            <div className="p-6 border-b border-gray-800">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-semibold text-white">Pitch Preview</h2>
+                <button
+                  onClick={() => setPreviewPitch(null)}
+                  className="text-gray-400 hover:text-white"
+                >
+                  <X className="h-6 w-6" />
+                </button>
+              </div>
+            </div>
+            <div className="p-6 overflow-y-auto max-h-[60vh]">
+              <pre className="text-white whitespace-pre-wrap font-sans">
+                {previewPitch.content}
+              </pre>
+            </div>
           </div>
         </div>
       )}

@@ -54,6 +54,7 @@ export function validateTemplate(template: string, availableColumns: string[]): 
   validPlaceholders: string[]
 } {
   const placeholders = extractPlaceholders(template)
+  const columnNamesLower = availableColumns.map(c => c.toLowerCase())
   
   const validPlaceholders: string[] = []
   const invalidPlaceholders: string[] = []
@@ -91,7 +92,7 @@ export async function generatePitch(params: GeneratePitchParams): Promise<string
   
   try {
     const response = await openai.chat.completions.create({
-      model: process.env.REACT_APP_OPENAI_MODEL || 'gpt-5-mini',
+      model: 'gpt-5-mini',
       messages: [
         {
           role: 'system',
@@ -102,8 +103,8 @@ export async function generatePitch(params: GeneratePitchParams): Promise<string
           content: filledPrompt
         }
       ],
-      max_completion_tokens: parseInt(process.env.REACT_APP_OPENAI_MAX_TOKENS || '1000'),
-      temperature: 0.7,
+    
+      
     })
 
     return response.choices[0]?.message?.content || 'Failed to generate pitch'

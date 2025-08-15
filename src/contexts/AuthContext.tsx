@@ -1,19 +1,17 @@
 import { createContext, useContext, useEffect, useState } from 'react'
-import { User } from '@supabase/supabase-js'
-import { supabase, isSupabaseConfigured } from '../lib/supabase'
+import { User, AuthChangeEvent, Session } from '@supabase/supabase-js'
+import { supabase } from '../lib/supabase'
 
 interface AuthContextType {
   user: User | null
   loading: boolean
   signOut: () => Promise<void>
-  isConfigured: boolean
 }
 
 const AuthContext = createContext<AuthContextType>({
   user: null,
   loading: true,
   signOut: async () => {},
-  isConfigured: false,
 })
 
 export const useAuth = () => {
@@ -29,29 +27,15 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    // If Supabase is not configured, just set loading to false
-    if (!isSupabaseConfigured) {
-      setLoading(false)
-      return
-    }
-
     const getSession = async () => {
-      try {
-        const { data: { session }, error } = await supabase.auth.getSession()
-        if (error) {
-          console.error('Auth session error:', error)
-        }
-        setUser(session?.user ?? null)
-        setLoading(false)
-      } catch (error) {
-        console.error('Auth context error:', error)
-        setLoading(false)
-      }
+      const { data: { session } } = await supabase.auth.getSession()
+      setUser(session?.user ?? null)
+      setLoading(false)
     }
 
     getSession()
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event: AuthChangeEvent, session: Session | null) => {
       setUser(session?.user ?? null)
     })
 
@@ -59,16 +43,12 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   }, [])
 
   const signOut = async () => {
-    if (!isSupabaseConfigured) {
-      console.warn('Cannot sign out: Supabase is not configured')
-      return
-    }
     await supabase.auth.signOut()
     setUser(null)
   }
 
   return (
-    <AuthContext.Provider value={{ user, loading, signOut, isConfigured: isSupabaseConfigured }}>
+    <AuthContext.Provider value={{ user, loading, signOut }}>
       {children}
     </AuthContext.Provider>
   )
